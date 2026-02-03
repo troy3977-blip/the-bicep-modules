@@ -1,0 +1,155 @@
+name: build-push-deploy (OIDC)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  # ----- REQUIRED: set these GitHub Actions variables (Settings -> Secrets and variables -> Actions) -----
+  AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  AZURE_TENANT_ID:       ${{ secrets.AZURE_TENANT_ID }}
+  AZURE_CLIENT_ID:       ${{ secrets.AZURE_CLIENT_ID }}
+
+  RESOURCE_GROUP:        ${{ vars.RESOURCE_GROUP }}
+  ACR_NAME:              ${{ vars.ACR_NAME }}              # e.g. troywfmdevacr
+  WFM_APP_NAME:          ${{ vars.WFM_APP_NAME }}          # e.g. troywfm-dev-wfm
+  DOT_APP_NAME:          ${{ vars.DOT_APP_NAME }}          # e.g. troywfm-dev-dot
+
+  # Optional: API app (leave empty if not using)
+  API_APP_NAME:          ${{ vars.API_APP_NAME }}          # e.g. troywfm-dev-api
+
+  # ----- Image repos in ACR (must match what your Bicep expects) -----
+  WFM_IMAGE_REPO:        wfm-staffing-app
+  DOT_IMAGE_REPO:        dot-strategy
+  API_IMAGE_REPO:        wfm-api
+
+  # Paths to Docker build contexts (adjust to your repo)
+  WFM_CONTEXT:           .
+  DOT_CONTEXT:           .
+  API_CONTEXT:           .
+
+  # Dockerfile locations (adjust to your repo)
+  WFM_DOCKERFILE:        ./Dockerfile.wfm
+  DOT_DOCKERFILE:        ./Dockerfile.dot
+  API_DOCKERFILE:        ./Dockerfile.api
+
+jobs:
+  build_push_deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # OIDC login (no secrets beyond IDs above)
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Resolve ACR login server
+        id: acr
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOGIN_SERVER=$(az acr show -n "${ACR_NAME}" -g "${RESOURCE_GROUP}" --query "loginServer" -o tsv)
+          echo "login_server=${LOGIN_SERVER}" >> "$GITHUB_OUTPUT"
+
+      # Log in Docker to ACR using the logged-in Azure identity (OIDC)
+      - name: ACR docker login
+        shell: bash
+        run: |
+          set -euo pipefail
+          az acr login -n "${ACR_NAME}"
+
+      - name: Compute image tag
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Use short SHA for immutability
+          TAG="${GITHUB_SHA::7}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      # -------- Build & Push: WFM --------
+      - name: Build & push WFM image
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMG="${{ steps.acr.outputs.login_server }}/${WFM_IMAGE_REPO}:${{ steps.tag.outputs.tag }}"
+          docker build -f "${WFM_DOCKERFILE}" -t "${IMG}" "${WFM_CONTEXT}"
+          docker push "${IMG}"
+
+      # -------- Build & Push: DOT --------
+      - name: Build & push DOT image
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMG="${{ steps.acr.outputs.login_server }}/${DOT_IMAGE_REPO}:${{ steps.tag.outputs.tag }}"
+          docker build -f "${DOT_DOCKERFILE}" -t "${IMG}" "${DOT_CONTEXT}"
+          docker push "${IMG}"
+
+      # -------- Optional: Build & Push API --------
+      - name: Build & push API image (optional)
+        if: ${{ env.API_APP_NAME != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMG="${{ steps.acr.outputs.login_server }}/${API_IMAGE_REPO}:${{ steps.tag.outputs.tag }}"
+          docker build -f "${API_DOCKERFILE}" -t "${IMG}" "${API_CONTEXT}"
+          docker push "${IMG}"
+
+      # -------- Deploy (set Web App container image) --------
+      # NOTE: App Service pulls from ACR using the Web App's Managed Identity + AcrPull (your Bicep roleAssignments module)
+      - name: Deploy WFM web app
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMG="${{ steps.acr.outputs.login_server }}/${WFM_IMAGE_REPO}:${{ steps.tag.outputs.tag }}"
+          az webapp config container set \
+            -g "${RESOURCE_GROUP}" \
+            -n "${WFM_APP_NAME}" \
+            --docker-custom-image-name "${IMG}" \
+            --docker-registry-server-url "https://${{ steps.acr.outputs.login_server }}"
+
+          az webapp restart -g "${RESOURCE_GROUP}" -n "${WFM_APP_NAME}"
+
+      - name: Deploy DOT web app
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMG="${{ steps.acr.outputs.login_server }}/${DOT_IMAGE_REPO}:${{ steps.tag.outputs.tag }}"
+          az webapp config container set \
+            -g "${RESOURCE_GROUP}" \
+            -n "${DOT_APP_NAME}" \
+            --docker-custom-image-name "${IMG}" \
+            --docker-registry-server-url "https://${{ steps.acr.outputs.login_server }}"
+
+          az webapp restart -g "${RESOURCE_GROUP}" -n "${DOT_APP_NAME}"
+
+      - name: Deploy API web app (optional)
+        if: ${{ env.API_APP_NAME != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMG="${{ steps.acr.outputs.login_server }}/${API_IMAGE_REPO}:${{ steps.tag.outputs.tag }}"
+          az webapp config container set \
+            -g "${RESOURCE_GROUP}" \
+            -n "${API_APP_NAME}" \
+            --docker-custom-image-name "${IMG}" \
+            --docker-registry-server-url "https://${{ steps.acr.outputs.login_server }}"
+
+          az webapp restart -g "${RESOURCE_GROUP}" -n "${API_APP_NAME}"
+
+      - name: Output deployed tags
+        shell: bash
+        run: |
+          echo "Deployed tag: ${{ steps.tag.outputs.tag }}"
+          echo "ACR: ${{ steps.acr.outputs.login_server }}"
